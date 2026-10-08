@@ -1,0 +1,482 @@
+package com.sanedge.saldo.service.impl;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.lenient;
+import static org.mockito.Mockito.when;
+
+import java.time.Instant;
+import java.time.LocalDateTime;
+import java.util.function.Supplier;
+
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Nested;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
+
+import com.sanedge.common.adapter.card.CardPort;
+import com.sanedge.common.adapter.model.Card;
+import com.sanedge.common.config.RedisService;
+import com.sanedge.common.domain.response.ApiResponse;
+import com.sanedge.common.exception.InvalidRequestException;
+import com.sanedge.common.exception.ResourceNotFoundException;
+import com.sanedge.common.observability.TracingMetrics;
+import com.sanedge.saldo.domain.requests.CreateSaldoRequest;
+import com.sanedge.saldo.domain.requests.UpdateSaldoRequest;
+import com.sanedge.saldo.domain.requests.UpdateSaldoBalance;
+import com.sanedge.saldo.domain.requests.UpdateSaldoWithdraw;
+import com.sanedge.saldo.domain.response.SaldoResponse;
+import com.sanedge.saldo.domain.response.SaldoResponseDeleteAt;
+import com.sanedge.saldo.entity.Saldo;
+import com.sanedge.saldo.repository.SaldoCommandRepository;
+import com.sanedge.saldo.repository.SaldoQueryRepository;
+
+import io.opentelemetry.api.common.Attributes;
+import io.smallrye.mutiny.Uni;
+
+@ExtendWith(MockitoExtension.class)
+class SaldoCommandServiceImplTest {
+
+    private static final String SALDO_ID = "507f1f77bcf86cd799439011";
+
+    @Mock
+    private CardPort cardPort;
+    @Mock
+    private SaldoCommandRepository saldoCommandRepo;
+    @Mock
+    private SaldoQueryRepository saldoQueryRepo;
+    @Mock
+    private RedisService redisService;
+
+    private TracingMetrics tracingMetrics;
+
+    private SaldoCommandServiceImpl service;
+
+    @BeforeEach
+    void setUp() {
+        tracingMetrics = org.mockito.Mockito.mock(TracingMetrics.class,
+                org.mockito.Mockito.withSettings().lenient());
+
+        // Lenient stubbing for tracingMetrics – the service uses both two-argument and
+        // three-argument versions
+        lenient().doAnswer(inv -> {
+            @SuppressWarnings("unchecked")
+            Supplier<Uni<?>> s = inv.getArgument(3);
+            return s.get();
+        })
+                .when(tracingMetrics).traceAndMeasure(anyString(), anyString(), any(Attributes.class), any());
+        lenient().doAnswer(inv -> {
+            @SuppressWarnings("unchecked")
+            Supplier<Uni<?>> s = inv.getArgument(2);
+            return s.get();
+        })
+                .when(tracingMetrics).traceAndMeasure(anyString(), anyString(), any());
+
+        service = new SaldoCommandServiceImpl(cardPort, saldoCommandRepo, saldoQueryRepo, redisService,
+                tracingMetrics);
+        lenient().when(redisService.deleteReactive(anyString())).thenReturn(Uni.createFrom().voidItem());
+        lenient().when(saldoQueryRepo.findByCardNumber(anyString())).thenReturn(Uni.createFrom().nullItem());
+        lenient().when(saldoCommandRepo.deleteAllDeleted()).thenReturn(Uni.createFrom().item(true));
+        lenient().when(saldoCommandRepo.restoreAllDeleted()).thenReturn(Uni.createFrom().item(true));
+    }
+
+    private Saldo createSaldo(String id, String card, int balance) {
+        Saldo s = new Saldo();
+        s.setSaldoId(id);
+        s.setCardNumber(card);
+        s.setTotalBalance(balance);
+        s.setWithdrawAmount(0);
+        s.setCreatedAt(Instant.now());
+        s.setUpdatedAt(Instant.now());
+        return s;
+    }
+
+    private static Card cardWithEmail(String cardNumber) {
+        return new Card("card-1", "user-1", cardNumber, "VISA", "2030-01-01", "123", "BANK",
+                "test@test.com", null, null);
+    }
+
+    // helpers to create requests
+    private CreateSaldoRequest createReq() {
+        CreateSaldoRequest r = new CreateSaldoRequest();
+        r.setCardNumber("1234-5678-9012-3456");
+        r.setTotalBalance(100000L);
+        return r;
+    }
+
+    private UpdateSaldoRequest updateReq() {
+        UpdateSaldoRequest r = new UpdateSaldoRequest();
+        r.setSaldoId(SALDO_ID);
+        r.setCardNumber("1234-5678-9012-3456");
+        r.setTotalBalance(150000L);
+        return r;
+    }
+
+    private UpdateSaldoBalance balanceReq(String card, int balance) {
+        UpdateSaldoBalance r = new UpdateSaldoBalance();
+        r.setCardNumber(card);
+        r.setTotalBalance((long) balance);
+        return r;
+    }
+
+    private UpdateSaldoBalance balanceDeltaReq(String card, long delta, long minimum, String operationKey) {
+        UpdateSaldoBalance r = new UpdateSaldoBalance();
+        r.setCardNumber(card);
+        r.setDeltaBalance(delta);
+        r.setMinimumBalance(minimum);
+        r.setOperationKey(operationKey);
+        return r;
+    }
+
+    private UpdateSaldoWithdraw withdrawReq(String card, int balance, int amount) {
+        UpdateSaldoWithdraw r = new UpdateSaldoWithdraw();
+        r.setCardNumber(card);
+        r.setTotalBalance((long) balance);
+        r.setWithdrawAmount((long) amount);
+        r.setWithdrawTime(LocalDateTime.now());
+        return r;
+    }
+
+    private UpdateSaldoWithdraw withdrawDeltaReq(String card, long delta, long minimum, int amount, String operationKey) {
+        UpdateSaldoWithdraw r = new UpdateSaldoWithdraw();
+        r.setCardNumber(card);
+        r.setDeltaBalance(delta);
+        r.setMinimumBalance(minimum);
+        r.setWithdrawAmount((long) amount);
+        r.setWithdrawTime(LocalDateTime.now());
+        r.setOperationKey(operationKey);
+        return r;
+    }
+
+    // ----- create tests -----
+    @Nested
+    @DisplayName("create tests")
+    class CreateTests {
+        @Test
+        void success() {
+            CreateSaldoRequest req = createReq();
+            when(cardPort.findCardByCardNumber(any())).thenReturn(Uni.createFrom().item(cardWithEmail(req.getCardNumber())));
+            when(saldoCommandRepo.persist(any(Saldo.class))).thenAnswer(inv -> {
+                Saldo s = inv.getArgument(0);
+                s.setSaldoId(SALDO_ID);
+                return Uni.createFrom().item(s);
+            });
+
+            ApiResponse<SaldoResponse> resp = service.create(req).await().indefinitely();
+            assertThat(resp.status()).isEqualTo("success");
+            assertThat(resp.data().getId()).isEqualTo(SALDO_ID);
+            assertThat(resp.data().getCardNumber()).isEqualTo(req.getCardNumber());
+        }
+
+        @Test
+        void cardNotFound_returnsError() {
+            CreateSaldoRequest req = createReq();
+            when(cardPort.findCardByCardNumber(any())).thenReturn(
+                    Uni.createFrom().failure(new ResourceNotFoundException("Card not found")));
+
+            ApiResponse<SaldoResponse> resp = service.create(req).await().indefinitely();
+            assertThat(resp.status()).isEqualTo("error");
+            assertThat(resp.message()).contains("Card not found");
+        }
+    }
+
+    // ----- update tests -----
+    @Nested
+    @DisplayName("update tests")
+    class UpdateTests {
+        @Test
+        void success() {
+            UpdateSaldoRequest req = updateReq();
+            when(cardPort.findCardByCardNumber(any())).thenReturn(Uni.createFrom().item(cardWithEmail(req.getCardNumber())));
+            when(saldoQueryRepo.findById(SALDO_ID))
+                    .thenReturn(Uni.createFrom().item(createSaldo(SALDO_ID, req.getCardNumber(), 100000)));
+            Saldo persisted = new Saldo();
+            persisted.setSaldoId(SALDO_ID);
+            persisted.setCardNumber(req.getCardNumber());
+            persisted.setTotalBalance(150000);
+            persisted.setWithdrawAmount(0);
+            when(saldoCommandRepo.persist(any(Saldo.class)))
+                    .thenReturn(Uni.createFrom().item(persisted));
+
+            ApiResponse<SaldoResponse> resp = service.update(req).await().indefinitely();
+            assertThat(resp.status()).isEqualTo("success");
+            assertThat(resp.data().getTotalBalance()).isEqualTo(150000);
+        }
+
+        @Test
+        void notFound() {
+            UpdateSaldoRequest req = updateReq();
+            when(cardPort.findCardByCardNumber(any())).thenReturn(Uni.createFrom().item(cardWithEmail(req.getCardNumber())));
+            when(saldoQueryRepo.findById(SALDO_ID)).thenReturn(Uni.createFrom().nullItem());
+
+            ApiResponse<SaldoResponse> resp = service.update(req).await().indefinitely();
+            assertThat(resp.status()).isEqualTo("error");
+            assertThat(resp.message()).contains("Saldo not found");
+        }
+
+        @Test
+        void nullId_returnsError() {
+            UpdateSaldoRequest req = updateReq();
+            req.setSaldoId(null);
+            ApiResponse<SaldoResponse> resp = service.update(req).await().indefinitely();
+            assertThat(resp.status()).isEqualTo("error");
+            assertThat(resp.message()).contains("saldo_id is required");
+        }
+    }
+
+    // ----- trash tests -----
+    @Nested
+    @DisplayName("trash tests")
+    class TrashTests {
+        @Test
+        void success() {
+            Saldo trashed = createSaldo(SALDO_ID, "card", 100);
+            trashed.setDeletedAt(Instant.now());
+            when(saldoCommandRepo.trashed(SALDO_ID)).thenReturn(Uni.createFrom().item(trashed));
+
+            ApiResponse<SaldoResponseDeleteAt> resp = service.trash(SALDO_ID).await().indefinitely();
+            assertThat(resp.status()).isEqualTo("success");
+            assertThat(resp.data().getDeletedAt()).isNotNull();
+        }
+
+        @Test
+        void notFound() {
+            when(saldoCommandRepo.trashed(SALDO_ID)).thenReturn(Uni.createFrom().nullItem());
+            ApiResponse<SaldoResponseDeleteAt> resp = service.trash(SALDO_ID).await().indefinitely();
+            assertThat(resp.status()).isEqualTo("error");
+            assertThat(resp.message()).contains("Saldo not found");
+        }
+    }
+
+    // ----- restore tests -----
+    @Nested
+    @DisplayName("restore tests")
+    class RestoreTests {
+        @Test
+        void success() {
+            when(saldoCommandRepo.restore(SALDO_ID)).thenReturn(Uni.createFrom().item(createSaldo(SALDO_ID, "card", 100)));
+            ApiResponse<SaldoResponseDeleteAt> resp = service.restore(SALDO_ID).await().indefinitely();
+            assertThat(resp.status()).isEqualTo("success");
+        }
+
+        @Test
+        void notFoundOrNotTrashed() {
+            when(saldoCommandRepo.restore(SALDO_ID)).thenReturn(Uni.createFrom().nullItem());
+            assertThatThrownBy(() -> service.restore(SALDO_ID).await().indefinitely())
+                    .isInstanceOf(InvalidRequestException.class)
+                    .hasMessageContaining("must be trashed first");
+        }
+    }
+
+    // ----- delete (permanent) tests -----
+    @Nested
+    @DisplayName("delete tests")
+    class DeleteTests {
+        @Test
+        void success() {
+            Saldo trashed = createSaldo(SALDO_ID, "card", 100);
+            trashed.setDeletedAt(Instant.now());
+            when(saldoQueryRepo.findById(SALDO_ID)).thenReturn(Uni.createFrom().item(trashed));
+            when(saldoCommandRepo.deletePermanent(SALDO_ID)).thenReturn(Uni.createFrom().item(true));
+
+            ApiResponse<Boolean> resp = service.delete(SALDO_ID).await().indefinitely();
+            assertThat(resp.status()).isEqualTo("success");
+            assertThat(resp.data()).isTrue();
+        }
+
+        @Test
+        void notTrashed_throws() {
+            when(saldoQueryRepo.findById(SALDO_ID)).thenReturn(Uni.createFrom().item(createSaldo(SALDO_ID, "card", 100)));
+            assertThatThrownBy(() -> service.delete(SALDO_ID).await().indefinitely())
+                    .isInstanceOf(InvalidRequestException.class)
+                    .hasMessageContaining("must be trashed");
+        }
+    }
+
+    // ----- restoreAll tests -----
+    @Nested
+    @DisplayName("restoreAll tests")
+    class RestoreAllTests {
+        @Test
+        void success() {
+            ApiResponse<Boolean> resp = service.restoreAll().await().indefinitely();
+            assertThat(resp.status()).isEqualTo("success");
+        }
+
+        @Test
+        void noTrashed_throws() {
+            when(saldoCommandRepo.restoreAllDeleted()).thenReturn(Uni.createFrom().item(false));
+            assertThatThrownBy(() -> service.restoreAll().await().indefinitely())
+                    .isInstanceOf(ResourceNotFoundException.class);
+        }
+    }
+
+    // ----- deleteAll tests -----
+    @Nested
+    @DisplayName("deleteAll tests")
+    class DeleteAllTests {
+        @Test
+        void success() {
+            ApiResponse<Boolean> resp = service.deleteAll().await().indefinitely();
+            assertThat(resp.status()).isEqualTo("success");
+        }
+
+        @Test
+        void noTrashed_throws() {
+            when(saldoCommandRepo.deleteAllDeleted()).thenReturn(Uni.createFrom().item(false));
+            assertThatThrownBy(() -> service.deleteAll().await().indefinitely())
+                    .isInstanceOf(ResourceNotFoundException.class);
+        }
+    }
+
+    // ----- updateSaldoBalance tests -----
+    @Nested
+    @DisplayName("updateSaldoBalance tests")
+    class UpdateSaldoBalanceTests {
+        @Test
+        void success() {
+            UpdateSaldoBalance req = balanceReq("card-1", 200000);
+            when(saldoQueryRepo.findByCardNumber(anyString()))
+                    .thenReturn(Uni.createFrom().item(createSaldo(SALDO_ID, "card-1", 50000)));
+            Saldo persisted = new Saldo();
+            persisted.setSaldoId(SALDO_ID);
+            persisted.setCardNumber("card-1");
+            persisted.setTotalBalance(200000);
+            persisted.setWithdrawAmount(0);
+            when(saldoCommandRepo.persist(any(Saldo.class)))
+                    .thenReturn(Uni.createFrom().item(persisted));
+
+            ApiResponse<SaldoResponse> resp = service.updateSaldoBalance(req).await().indefinitely();
+            assertThat(resp.status()).isEqualTo("success");
+            assertThat(resp.data().getTotalBalance()).isEqualTo(200000);
+        }
+
+        @Test
+        void notFound() {
+            UpdateSaldoBalance req = balanceReq("card-1", 200000);
+            when(saldoQueryRepo.findByCardNumber(anyString())).thenReturn(Uni.createFrom().nullItem());
+
+            ApiResponse<SaldoResponse> resp = service.updateSaldoBalance(req).await().indefinitely();
+            assertThat(resp.status()).isEqualTo("error");
+            assertThat(resp.message()).contains("Saldo not found");
+        }
+
+        @Test
+        void deltaAppliesAtomically() {
+            UpdateSaldoBalance req = balanceDeltaReq("card-1", -25000L, 10000L, "op:1");
+            when(saldoCommandRepo.updateBalanceByDelta("card-1", -25000L, 10000L, "op:1"))
+                    .thenReturn(Uni.createFrom().item(1));
+            when(saldoQueryRepo.findByCardNumber("card-1"))
+                    .thenReturn(Uni.createFrom().item(createSaldo(SALDO_ID, "card-1", 75000)));
+
+            ApiResponse<SaldoResponse> resp = service.updateSaldoBalance(req).await().indefinitely();
+            assertThat(resp.status()).isEqualTo("success");
+            assertThat(resp.data().getTotalBalance()).isEqualTo(75000);
+        }
+
+        @Test
+        void deltaRejectedWhenBelowMinimum() {
+            UpdateSaldoBalance req = balanceDeltaReq("card-1", -25000L, 10000L, "op:1");
+            when(saldoCommandRepo.updateBalanceByDelta("card-1", -25000L, 10000L, "op:1"))
+                    .thenReturn(Uni.createFrom().item(0));
+            when(saldoQueryRepo.findByCardNumber("card-1"))
+                    .thenReturn(Uni.createFrom().item(createSaldo(SALDO_ID, "card-1", 5000)));
+
+            ApiResponse<SaldoResponse> resp = service.updateSaldoBalance(req).await().indefinitely();
+            assertThat(resp.status()).isEqualTo("error");
+            assertThat(resp.message()).contains("Insufficient balance");
+        }
+
+        @Test
+        void deltaWithoutOperationKeyFails() {
+            UpdateSaldoBalance req = balanceDeltaReq("card-1", -25000L, 10000L, null);
+
+            ApiResponse<SaldoResponse> resp = service.updateSaldoBalance(req).await().indefinitely();
+            assertThat(resp.status()).isEqualTo("error");
+            assertThat(resp.message()).contains("operation_key");
+        }
+    }
+
+    @Nested
+    @DisplayName("updateSaldoWithdraw tests")
+    class UpdateSaldoWithdrawTests {
+        @Test
+        void success() {
+            UpdateSaldoWithdraw req = withdrawReq("card-1", 150000, 5000);
+            when(saldoQueryRepo.findByCardNumber(anyString()))
+                    .thenReturn(Uni.createFrom().item(createSaldo(SALDO_ID, "card-1", 100000)));
+            Saldo persisted = new Saldo();
+            persisted.setSaldoId(SALDO_ID);
+            persisted.setCardNumber("card-1");
+            persisted.setTotalBalance(150000);
+            persisted.setWithdrawAmount(5000);
+            persisted.setWithdrawTime(Instant.now());
+            when(saldoCommandRepo.persist(any(Saldo.class)))
+                    .thenReturn(Uni.createFrom().item(persisted));
+
+            ApiResponse<SaldoResponse> resp = service.updateSaldoWithdraw(req).await().indefinitely();
+            assertThat(resp.status()).isEqualTo("success");
+            assertThat(resp.data().getTotalBalance()).isEqualTo(150000);
+            assertThat(resp.data().getWithdrawAmount()).isEqualTo(5000);
+        }
+
+        @Test
+        void notFound() {
+            UpdateSaldoWithdraw req = withdrawReq("card-1", 150000, 5000);
+            when(saldoQueryRepo.findByCardNumber(anyString())).thenReturn(Uni.createFrom().nullItem());
+
+            ApiResponse<SaldoResponse> resp = service.updateSaldoWithdraw(req).await().indefinitely();
+            assertThat(resp.status()).isEqualTo("error");
+            assertThat(resp.message()).contains("Saldo not found");
+        }
+
+        @Test
+        void deltaAppliesAtomically() {
+            UpdateSaldoWithdraw req = withdrawDeltaReq("card-1", -50000L, 0L, 50000, "op:w1");
+            when(saldoCommandRepo.updateBalanceByDelta("card-1", -50000L, 0L, "op:w1"))
+                    .thenReturn(Uni.createFrom().item(1));
+            Saldo persisted = new Saldo();
+            persisted.setSaldoId(SALDO_ID);
+            persisted.setCardNumber("card-1");
+            persisted.setTotalBalance(50000);
+            persisted.setWithdrawAmount(50000);
+            persisted.setWithdrawTime(Instant.now());
+            when(saldoQueryRepo.findByCardNumber("card-1"))
+                    .thenReturn(Uni.createFrom().item(createSaldo(SALDO_ID, "card-1", 50000)));
+            when(saldoCommandRepo.persist(any(Saldo.class)))
+                    .thenReturn(Uni.createFrom().item(persisted));
+
+            ApiResponse<SaldoResponse> resp = service.updateSaldoWithdraw(req).await().indefinitely();
+            assertThat(resp.status()).isEqualTo("success");
+            assertThat(resp.data().getTotalBalance()).isEqualTo(50000);
+            assertThat(resp.data().getWithdrawAmount()).isEqualTo(50000);
+        }
+
+        @Test
+        void deltaRejectedWhenBelowMinimum() {
+            UpdateSaldoWithdraw req = withdrawDeltaReq("card-1", -50000L, 10000L, 50000, "op:w1");
+            when(saldoCommandRepo.updateBalanceByDelta("card-1", -50000L, 10000L, "op:w1"))
+                    .thenReturn(Uni.createFrom().item(0));
+            when(saldoQueryRepo.findByCardNumber("card-1"))
+                    .thenReturn(Uni.createFrom().item(createSaldo(SALDO_ID, "card-1", 5000)));
+
+            ApiResponse<SaldoResponse> resp = service.updateSaldoWithdraw(req).await().indefinitely();
+            assertThat(resp.status()).isEqualTo("error");
+            assertThat(resp.message()).contains("Insufficient balance");
+        }
+
+        @Test
+        void deltaWithoutOperationKeyFails() {
+            UpdateSaldoWithdraw req = withdrawDeltaReq("card-1", -50000L, 0L, 50000, null);
+
+            ApiResponse<SaldoResponse> resp = service.updateSaldoWithdraw(req).await().indefinitely();
+            assertThat(resp.status()).isEqualTo("error");
+            assertThat(resp.message()).contains("operation_key");
+        }
+    }
+}

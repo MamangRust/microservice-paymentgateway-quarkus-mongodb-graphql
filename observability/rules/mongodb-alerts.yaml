@@ -1,0 +1,34 @@
+groups:
+  - name: mongodb-alerts
+    rules:
+      - alert: MongoDBDown
+        expr: |
+          mongodb_up == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "MongoDB instance {{ $labels.instance }} is down"
+          description: "MongoDB is unreachable for 1 minute — all payment operations will fail."
+          runbook: "Check the mongod container/StatefulSet health and PVC status."
+
+      - alert: MongoDBHighConnections
+        expr: |
+          mongodb_ss_connections{conn_type="current"} > 200
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High MongoDB connection count on {{ $labels.instance }} ({{ $value }})"
+          description: "MongoDB exceeds 200 current connections — connection pool pressure."
+          runbook: "Check the connection pool sizes and idle connections; verify no connection leak in the Vert.x/Mongo clients."
+
+      - alert: MongoDBExporterScrapeError
+        expr: |
+          up{job="mongodb-exporter"} == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "MongoDB exporter scrape error"
+          description: "mongodb-exporter is failing to scrape database metrics."

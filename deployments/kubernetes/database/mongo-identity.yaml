@@ -1,0 +1,80 @@
+# MongoDB instance for the `identity` bounded context (database pg_identity).
+# Consumers: auth, role, user.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mongo-identity
+  namespace: payment-gateway
+spec:
+  serviceName: mongo-identity
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mongo-identity
+  template:
+    metadata:
+      labels:
+        app: mongo-identity
+        tier: mongo
+    spec:
+      containers:
+        - name: mongo
+          image: mongo:7
+          imagePullPolicy: IfNotPresent
+          args: ["mongod", "--wiredTigerCacheSizeGB", "1"]
+          ports:
+            - name: mongo
+              containerPort: 27017
+          volumeMounts:
+            - name: mongo-data
+              mountPath: /data/db
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "250m"
+            limits:
+              memory: "1Gi"
+              cpu: "500m"
+          readinessProbe:
+            exec:
+              command: ["mongosh", "--quiet", "--eval", "db.adminCommand({ ping: 1 })"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            exec:
+              command: ["mongosh", "--quiet", "--eval", "db.adminCommand({ ping: 1 })"]
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            failureThreshold: 3
+      volumes:
+        - name: mongo-data
+          persistentVolumeClaim:
+            claimName: mongo-identity
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mongo-identity
+  namespace: payment-gateway
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mongo-identity
+  namespace: payment-gateway
+spec:
+  # Headless: alamat stabil mongo-identity.payment-gateway.svc.cluster.local untuk
+  # service pemakai context ini. Hanya diakses dari dalam cluster (tanpa LoadBalancer).
+  clusterIP: None
+  selector:
+    app: mongo-identity
+  ports:
+    - name: mongo
+      port: 27017
+      targetPort: 27017

@@ -1,0 +1,248 @@
+package com.sanedge.card.handler;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.when;
+
+import java.time.LocalDate;
+import java.util.List;
+
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
+import org.mockito.junit.jupiter.MockitoSettings;
+import org.mockito.quality.Strictness;
+
+import com.sanedge.card.domain.response.CardResponse;
+import com.sanedge.card.domain.response.CardResponseDeleteAt;
+import com.sanedge.card.service.CardQueryService;
+import com.sanedge.common.adapter.model.User;
+import com.sanedge.common.adapter.user.UserPort;
+import com.sanedge.common.domain.response.ApiResponse;
+import com.sanedge.common.domain.response.ApiResponsePagination;
+
+import io.grpc.StatusRuntimeException;
+import io.smallrye.mutiny.Uni;
+import pb.card.Card;
+import pb.card.CardQuery;
+
+@ExtendWith(MockitoExtension.class)
+@MockitoSettings(strictness = Strictness.LENIENT)
+class CardQueryGrpcHandlerTest {
+
+    @Mock
+    private CardQueryService cardQueryService;
+
+    @Mock
+    private UserPort userPort;
+
+    private CardQueryGrpcHandler handler;
+
+    @BeforeEach
+    void setUp() {
+        handler = new CardQueryGrpcHandler();
+        handler.cardQueryService = cardQueryService;
+        handler.userPort = userPort;
+    }
+
+    // helpers
+    private CardResponse createCardResponse(String id) {
+        CardResponse r = new CardResponse();
+        r.setId(id);
+        r.setCardNumber("1234-5678-9012-3456");
+        r.setCardType("VISA");
+        r.setCardProvider("BCA");
+        r.setUserId("507f1f77bcf86cd799439100");
+        r.setExpireDate(LocalDate.of(2027, 12, 31).toString());
+        r.setCvv("123");
+        r.setCreatedAt("2024-01-01T00:00:00Z");
+        r.setUpdatedAt("2024-01-02T00:00:00Z");
+        return r;
+    }
+
+    private CardResponseDeleteAt createCardDeleteAt(String id) {
+        CardResponseDeleteAt r = new CardResponseDeleteAt();
+        r.setId(id);
+        r.setCardNumber("1234-5678-9012-3456");
+        r.setCardType("VISA");
+        r.setCardProvider("BCA");
+        r.setUserId("507f1f77bcf86cd799439100");
+        r.setExpireDate(LocalDate.of(2027, 12, 31).toString());
+        r.setCvv("123");
+        r.setCreatedAt("2024-01-01T00:00:00Z");
+        r.setUpdatedAt("2024-01-02T00:00:00Z");
+        r.setDeletedAt("2024-06-01T00:00:00Z");
+        return r;
+    }
+
+    // findAllCard
+    @Test
+    @DisplayName("findAllCard - success")
+    void findAllCard_Success() {
+        Card.FindAllCardRequest request = Card.FindAllCardRequest.newBuilder()
+                .setPage(1).setPageSize(10).build();
+        CardResponse data = createCardResponse("507f1f77bcf86cd799439001");
+        ApiResponsePagination<List<CardResponse>> apiResp = new ApiResponsePagination<>(
+                "success", "Cards retrieved", List.of(data), null);
+        when(cardQueryService.findAll(any())).thenReturn(Uni.createFrom().item(apiResp));
+
+        CardQuery.ApiResponsePaginationCard response = handler.findAllCard(request).await().indefinitely();
+        assertThat(response.getStatus()).isEqualTo("success");
+        assertThat(response.getDataCount()).isEqualTo(1);
+        assertThat(response.getData(0).getCardNumber()).isEqualTo("1234-5678-9012-3456");
+    }
+
+    @Test
+    @DisplayName("findAllCard - error")
+    void findAllCard_Error() {
+        when(cardQueryService.findAll(any())).thenReturn(Uni.createFrom().failure(new RuntimeException("DB error")));
+        try {
+            handler.findAllCard(Card.FindAllCardRequest.newBuilder().build()).await().indefinitely();
+        } catch (StatusRuntimeException e) {
+            assertThat(e).isNotNull();
+        }
+    }
+
+    // findByIdCard
+    @Test
+    @DisplayName("findByIdCard - success")
+    void findByIdCard_Success() {
+        Card.FindByIdCardRequest request = Card.FindByIdCardRequest.newBuilder().setCardId("507f1f77bcf86cd799439001").build();
+        CardResponse data = createCardResponse("507f1f77bcf86cd799439001");
+        ApiResponse<CardResponse> apiResp = ApiResponse.success("Card found", data);
+        when(cardQueryService.findById(any())).thenReturn(Uni.createFrom().item(apiResp));
+
+        Card.ApiResponseCard response = handler.findByIdCard(request).await().indefinitely();
+        assertThat(response.getStatus()).isEqualTo("success");
+        assertThat(response.getData().getId()).isEqualTo("507f1f77bcf86cd799439001");
+    }
+
+    @Test
+    @DisplayName("findByIdCard - error")
+    void findByIdCard_Error() {
+        when(cardQueryService.findById(any())).thenReturn(Uni.createFrom().failure(new RuntimeException("fail")));
+        try {
+            handler.findByIdCard(Card.FindByIdCardRequest.newBuilder().setCardId("507f1f77bcf86cd799439001").build()).await().indefinitely();
+        } catch (StatusRuntimeException e) {
+            assertThat(e).isNotNull();
+        }
+    }
+
+    // findByUserIdCard
+    @Test
+    @DisplayName("findByUserIdCard - success")
+    void findByUserIdCard_Success() {
+        Card.FindByUserIdCardRequest request = Card.FindByUserIdCardRequest.newBuilder().setUserId("507f1f77bcf86cd799439100").build();
+        CardResponse data = createCardResponse("507f1f77bcf86cd799439001");
+        ApiResponse<CardResponse> apiResp = ApiResponse.success("Card found", data);
+        when(cardQueryService.findByUserId(any())).thenReturn(Uni.createFrom().item(apiResp));
+
+        Card.ApiResponseCard response = handler.findByUserIdCard(request).await().indefinitely();
+        assertThat(response.getStatus()).isEqualTo("success");
+        assertThat(response.getData().getUserId()).isEqualTo("507f1f77bcf86cd799439100");
+    }
+
+    // findByActiveCard
+    @Test
+    @DisplayName("findByActiveCard - success")
+    void findByActiveCard_Success() {
+        Card.FindAllCardRequest request = Card.FindAllCardRequest.newBuilder().setPage(1).build();
+        CardResponseDeleteAt data = createCardDeleteAt("507f1f77bcf86cd799439001");
+        ApiResponsePagination<List<CardResponseDeleteAt>> apiResp = new ApiResponsePagination<>(
+                "success", "Active cards", List.of(data), null);
+        when(cardQueryService.findByActive(any())).thenReturn(Uni.createFrom().item(apiResp));
+
+        CardQuery.ApiResponsePaginationCardDeleteAt response = handler.findByActiveCard(request).await().indefinitely();
+        assertThat(response.getStatus()).isEqualTo("success");
+        assertThat(response.getDataCount()).isEqualTo(1);
+        assertThat(response.getData(0).hasDeletedAt()).isTrue();
+    }
+
+    // findByTrashedCard
+    @Test
+    @DisplayName("findByTrashedCard - success")
+    void findByTrashedCard_Success() {
+        Card.FindAllCardRequest request = Card.FindAllCardRequest.newBuilder().build();
+        CardResponseDeleteAt data = createCardDeleteAt("507f1f77bcf86cd799439002");
+        ApiResponsePagination<List<CardResponseDeleteAt>> apiResp = new ApiResponsePagination<>(
+                "success", "Trashed cards", List.of(data), null);
+        when(cardQueryService.findByTrashed(any())).thenReturn(Uni.createFrom().item(apiResp));
+
+        CardQuery.ApiResponsePaginationCardDeleteAt response = handler.findByTrashedCard(request).await()
+                .indefinitely();
+        assertThat(response.getStatus()).isEqualTo("success");
+        assertThat(response.getData(0).hasDeletedAt()).isTrue();
+    }
+
+    // findByCardNumber
+    @Test
+    @DisplayName("findByCardNumber - success")
+    void findByCardNumber_Success() {
+        Card.FindByCardNumberRequest request = Card.FindByCardNumberRequest.newBuilder().setCardNumber("1234-5678")
+                .build();
+        CardResponse data = createCardResponse("507f1f77bcf86cd799439001");
+        ApiResponse<CardResponse> apiResp = ApiResponse.success("Card found", data);
+        when(cardQueryService.findByCardNumber(anyString())).thenReturn(Uni.createFrom().item(apiResp));
+
+        Card.ApiResponseCard response = handler.findByCardNumber(request).await().indefinitely();
+        assertThat(response.getStatus()).isEqualTo("success");
+        assertThat(response.getData().getCardNumber()).isEqualTo("1234-5678-9012-3456");
+    }
+
+    // findUserCardByCardNumber
+    @Test
+    @DisplayName("findUserCardByCardNumber - success with email")
+    void findUserCardByCardNumber_Success() {
+        Card.FindByCardNumberRequest request = Card.FindByCardNumberRequest.newBuilder().setCardNumber("1234-5678")
+                .build();
+        CardResponse data = createCardResponse("507f1f77bcf86cd799439001");
+        ApiResponse<CardResponse> apiResp = ApiResponse.success("Card found", data);
+        when(cardQueryService.findByCardNumber(anyString())).thenReturn(Uni.createFrom().item(apiResp));
+
+        User user = new User("507f1f77bcf86cd799439100", null, null, "user@test.com", null, null);
+        when(userPort.findById(any())).thenReturn(Uni.createFrom().item(user));
+
+        Card.CardWithEmailResponse response = handler.findUserCardByCardNumber(request).await().indefinitely();
+        assertThat(response.getEmail()).isEqualTo("user@test.com");
+        assertThat(response.getCardNumber()).isEqualTo("1234-5678-9012-3456");
+    }
+
+    @Test
+    @DisplayName("findUserCardByCardNumber - card not found")
+    void findUserCardByCardNumber_NotFound() {
+        Card.FindByCardNumberRequest request = Card.FindByCardNumberRequest.newBuilder().setCardNumber("invalid")
+                .build();
+        when(cardQueryService.findByCardNumber(anyString())).thenReturn(Uni.createFrom().nullItem());
+        try {
+            handler.findUserCardByCardNumber(request).await().indefinitely();
+        } catch (StatusRuntimeException e) {
+            assertThat(e).isNotNull();
+        }
+    }
+
+    // edge cases
+    @Test
+    @DisplayName("findAllCard - empty list")
+    void findAllCard_Empty() {
+        Card.FindAllCardRequest request = Card.FindAllCardRequest.newBuilder().build();
+        when(cardQueryService.findAll(any())).thenReturn(
+                Uni.createFrom().item(new ApiResponsePagination<>("success", "No cards", List.of(), null)));
+        CardQuery.ApiResponsePaginationCard response = handler.findAllCard(request).await().indefinitely();
+        assertThat(response.getDataCount()).isZero();
+    }
+
+    @Test
+    @DisplayName("findByIdCard - null data")
+    void findByIdCard_NullData() {
+        Card.FindByIdCardRequest request = Card.FindByIdCardRequest.newBuilder().setCardId("507f1f77bcf86cd799439001").build();
+        when(cardQueryService.findById(any()))
+                .thenReturn(Uni.createFrom().item(ApiResponse.success("No data", null)));
+        Card.ApiResponseCard response = handler.findByIdCard(request).await().indefinitely();
+        assertThat(response.hasData()).isFalse();
+    }
+}

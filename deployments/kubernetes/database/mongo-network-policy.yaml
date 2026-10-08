@@ -1,0 +1,81 @@
+# NetworkPolicies for the three MongoDB instances. Each policy allows ingress on
+# port 27017 ONLY from the pods of the services that own that bounded context
+# (PGTOMONGODB.md §1.1 / §3.4). No egress rules: mongod only answers inbound
+# connections.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mongo-identity
+  namespace: payment-gateway
+spec:
+  podSelector:
+    matchLabels:
+      app: mongo-identity
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: auth
+        - podSelector:
+            matchLabels:
+              app: role
+        - podSelector:
+            matchLabels:
+              app: user
+      ports:
+        - protocol: TCP
+          port: 27017
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mongo-payment
+  namespace: payment-gateway
+spec:
+  podSelector:
+    matchLabels:
+      app: mongo-payment
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: card
+        - podSelector:
+            matchLabels:
+              app: merchant
+        - podSelector:
+            matchLabels:
+              app: saldo
+      ports:
+        - protocol: TCP
+          port: 27017
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mongo-financial
+  namespace: payment-gateway
+spec:
+  podSelector:
+    matchLabels:
+      app: mongo-financial
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: topup
+        - podSelector:
+            matchLabels:
+              app: transaction
+        - podSelector:
+            matchLabels:
+              app: transfer
+        - podSelector:
+            matchLabels:
+              app: withdraw
+      ports:
+        - protocol: TCP
+          port: 27017

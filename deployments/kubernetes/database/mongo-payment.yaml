@@ -1,0 +1,84 @@
+# MongoDB instance for the `payment` bounded context (database pg_payment).
+# Consumers: card, merchant, saldo.
+#
+# NOTE (PGTOMONGODB.md §3.2): saldo money movement can opt into a single-node
+# replica set to regain multi-document transactions. That requires
+# `--replSet rs0` + an `rs.initiate()` job + `?replicaSet=rs0` on the connection
+# string. The playbook's §2.9 connection strings omit it and the code uses atomic
+# `$inc` updates + saga instead, so this manifest stays standalone to match.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mongo-payment
+  namespace: payment-gateway
+spec:
+  serviceName: mongo-payment
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mongo-payment
+  template:
+    metadata:
+      labels:
+        app: mongo-payment
+        tier: mongo
+    spec:
+      containers:
+        - name: mongo
+          image: mongo:7
+          imagePullPolicy: IfNotPresent
+          args: ["mongod", "--wiredTigerCacheSizeGB", "1"]
+          ports:
+            - name: mongo
+              containerPort: 27017
+          volumeMounts:
+            - name: mongo-data
+              mountPath: /data/db
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "500m"
+            limits:
+              memory: "2Gi"
+              cpu: "1000m"
+          readinessProbe:
+            exec:
+              command: ["mongosh", "--quiet", "--eval", "db.adminCommand({ ping: 1 })"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            exec:
+              command: ["mongosh", "--quiet", "--eval", "db.adminCommand({ ping: 1 })"]
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            failureThreshold: 3
+      volumes:
+        - name: mongo-data
+          persistentVolumeClaim:
+            claimName: mongo-payment
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mongo-payment
+  namespace: payment-gateway
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 20Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mongo-payment
+  namespace: payment-gateway
+spec:
+  clusterIP: None
+  selector:
+    app: mongo-payment
+  ports:
+    - name: mongo
+      port: 27017
+      targetPort: 27017

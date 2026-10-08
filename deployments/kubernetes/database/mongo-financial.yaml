@@ -1,0 +1,83 @@
+# MongoDB instance for the `financial` bounded context (database pg_financial).
+# Consumers: topup, transaction, transfer, withdraw.
+#
+# NOTE (PGTOMONGODB.md §3.2): see mongo-payment.yaml — this instance can also be
+# promoted to a single-node replica set if multi-document transactions are needed
+# for the ledger. Kept standalone to match the playbook's §2.9 connection strings
+# (atomic `$inc` + saga/outbox is the wired approach).
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mongo-financial
+  namespace: payment-gateway
+spec:
+  serviceName: mongo-financial
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mongo-financial
+  template:
+    metadata:
+      labels:
+        app: mongo-financial
+        tier: mongo
+    spec:
+      containers:
+        - name: mongo
+          image: mongo:7
+          imagePullPolicy: IfNotPresent
+          args: ["mongod", "--wiredTigerCacheSizeGB", "1"]
+          ports:
+            - name: mongo
+              containerPort: 27017
+          volumeMounts:
+            - name: mongo-data
+              mountPath: /data/db
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "500m"
+            limits:
+              memory: "2Gi"
+              cpu: "1000m"
+          readinessProbe:
+            exec:
+              command: ["mongosh", "--quiet", "--eval", "db.adminCommand({ ping: 1 })"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            exec:
+              command: ["mongosh", "--quiet", "--eval", "db.adminCommand({ ping: 1 })"]
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            failureThreshold: 3
+      volumes:
+        - name: mongo-data
+          persistentVolumeClaim:
+            claimName: mongo-financial
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mongo-financial
+  namespace: payment-gateway
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 20Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mongo-financial
+  namespace: payment-gateway
+spec:
+  clusterIP: None
+  selector:
+    app: mongo-financial
+  ports:
+    - name: mongo
+      port: 27017
+      targetPort: 27017
