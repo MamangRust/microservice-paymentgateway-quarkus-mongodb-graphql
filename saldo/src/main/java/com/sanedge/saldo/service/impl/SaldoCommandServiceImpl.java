@@ -16,6 +16,8 @@ import com.sanedge.common.observability.TracingMetrics;
 import com.sanedge.saldo.domain.response.SaldoResponse;
 import com.sanedge.saldo.domain.response.SaldoResponseDeleteAt;
 import com.sanedge.saldo.entity.Saldo;
+import com.sanedge.saldo.entity.Outbox;
+import com.sanedge.saldo.repository.OutboxRepository;
 import com.sanedge.common.exception.ResourceNotFoundException;
 import com.sanedge.common.exception.InvalidRequestException;
 import com.sanedge.saldo.repository.SaldoCommandRepository;
@@ -24,6 +26,7 @@ import com.sanedge.saldo.service.SaldoCommandService;
 
 import io.opentelemetry.api.common.Attributes;
 import io.smallrye.mutiny.Uni;
+import io.vertx.core.json.JsonObject;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 
@@ -36,6 +39,10 @@ public class SaldoCommandServiceImpl implements SaldoCommandService {
     private final SaldoQueryRepository saldoQueryRepository;
     private final RedisService redisService;
     private final TracingMetrics tracingMetrics;
+
+    /** Transactional outbox for the stats pipeline (field-injected to keep test constructors stable). */
+    @Inject
+    OutboxRepository outboxRepository;
 
     @Inject
     public SaldoCommandServiceImpl(CardPort cardPort,
@@ -83,6 +90,7 @@ public class SaldoCommandServiceImpl implements SaldoCommandService {
                                         String cacheKey = "saldo:card:" + request.getCardNumber();
 
                                         return redisService.deleteReactive(cacheKey)
+                                                .chain(v -> enqueueSaldoStatsEvent(savedSaldo))
                                                 .map(v -> ApiResponse.success("Create saldo success", SaldoResponse.from(savedSaldo)));
                                     });
                         })
@@ -132,7 +140,9 @@ public class SaldoCommandServiceImpl implements SaldoCommandService {
                                             return Uni.combine().all().unis(
                                                     redisService.deleteReactive(cacheId),
                                                     redisService.deleteReactive(cacheCard)
-                                            ).asTuple().map(t -> ApiResponse.success("Update saldo success", SaldoResponse.from(updatedSaldo)));
+                                            ).asTuple()
+                                                    .chain(t -> enqueueSaldoStatsEvent(updatedSaldo))
+                                                    .map(t -> ApiResponse.success("Update saldo success", SaldoResponse.from(updatedSaldo)));
                                         });
                             })
                             .onFailure().recoverWithItem(e -> {
@@ -336,6 +346,7 @@ public class SaldoCommandServiceImpl implements SaldoCommandService {
                             }
 
                             return evictSaldoCaches(request.getCardNumber(), saldo.getSaldoId())
+                                    .chain(v -> enqueueSaldoStatsEvent(saldo))
                                     .map(v -> ApiResponse.success("Update saldo balance success", SaldoResponse.from(saldo)));
                         }));
     }
@@ -354,8 +365,37 @@ public class SaldoCommandServiceImpl implements SaldoCommandService {
 
                     return saldoCommandRepository.persist(saldo)
                             .chain(savedSaldo -> evictSaldoCaches(request.getCardNumber(), savedSaldo.getSaldoId())
+                                    .chain(v -> enqueueSaldoStatsEvent(savedSaldo))
                                     .map(v -> ApiResponse.success("Update saldo balance success", SaldoResponse.from(savedSaldo))));
                 });
+    }
+
+    /**
+     * Emits {@code stats.payment.saldo.event} through the transactional outbox so
+     * the ClickHouse stats pipeline has a producer. The payload is a balance
+     * snapshot matching the {@code payment_stats.saldo_events} columns. Failure
+     * isolated: a stats hiccup must never fail the balance write.
+     */
+    private Uni<Void> enqueueSaldoStatsEvent(Saldo saldo) {
+        if (outboxRepository == null) {
+            return Uni.createFrom().voidItem();
+        }
+        JsonObject payload = new JsonObject()
+                .put("card_number", saldo.getCardNumber() != null ? saldo.getCardNumber() : "")
+                .put("total_balance", saldo.getTotalBalance() != null ? saldo.getTotalBalance() : 0);
+
+        JsonObject envelope = com.sanedge.common.event.EventEnvelope
+                .withDefaults(payload, "stats.payment.saldo.event");
+
+        Outbox outbox = new Outbox();
+        outbox.setDomain("saldo");
+        outbox.setEventId(java.util.UUID.randomUUID().toString());
+        outbox.setEventKey(saldo.getCardNumber());
+        outbox.setTopic("stats.payment.saldo.event");
+        outbox.setPayload(envelope.encode());
+        outbox.setStatus("PENDING");
+        return outboxRepository.persist(outbox).replaceWithVoid()
+                .onFailure().recoverWithItem((Void) null);
     }
 
     private Uni<Void> evictSaldoCaches(String cardNumber, String saldoId) {
@@ -424,6 +464,7 @@ public class SaldoCommandServiceImpl implements SaldoCommandService {
 
                             return saldoCommandRepository.persist(saldo)
                                     .chain(savedSaldo -> evictSaldoCaches(request.getCardNumber(), savedSaldo.getSaldoId())
+                                            .chain(v -> enqueueSaldoStatsEvent(savedSaldo))
                                             .map(v -> ApiResponse.success("Update saldo withdraw success", SaldoResponse.from(savedSaldo))));
                         }));
     }
@@ -448,6 +489,7 @@ public class SaldoCommandServiceImpl implements SaldoCommandService {
 
                     return saldoCommandRepository.persist(saldo)
                             .chain(savedSaldo -> evictSaldoCaches(request.getCardNumber(), savedSaldo.getSaldoId())
+                                    .chain(v -> enqueueSaldoStatsEvent(savedSaldo))
                                     .map(v -> ApiResponse.success("Update saldo withdraw success", SaldoResponse.from(savedSaldo))));
                 });
     }

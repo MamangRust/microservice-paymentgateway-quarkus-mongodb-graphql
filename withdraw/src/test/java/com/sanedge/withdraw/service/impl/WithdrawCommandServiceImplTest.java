@@ -3,6 +3,7 @@ package com.sanedge.withdraw.service.impl;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyDouble;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.lenient;
@@ -23,6 +24,7 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
 import com.sanedge.common.adapter.card.CardPort;
+import com.sanedge.common.adapter.fraud.FraudPort;
 import com.sanedge.common.adapter.model.Card;
 import com.sanedge.common.adapter.model.Saldo;
 import com.sanedge.common.adapter.model.SaldoMutationResult;
@@ -66,6 +68,9 @@ class WithdrawCommandServiceImplTest {
         private SaldoPort saldoPort;
 
         @Mock
+        private FraudPort fraudPort;
+
+        @Mock
         private Validator validator;
 
         @Mock
@@ -86,10 +91,16 @@ class WithdrawCommandServiceImplTest {
                                 withdrawCommandRepo,
                                 cardPort,
                                 saldoPort,
+                                fraudPort,
                                 validator,
                                 redisService,
                                 kafkaService,
                                 tracingMetrics);
+
+                // Default: security verification allows the withdraw.
+                lenient().when(fraudPort.verifySecurity(any(), any(), anyDouble()))
+                                .thenReturn(Uni.createFrom().item(
+                                                new FraudPort.SecurityResult(true, 0.1, "ok", "ALLOW")));
 
                 lenient().doAnswer(invocation -> {
                         Supplier<Uni<?>> supplier = invocation.getArgument(3);
@@ -201,6 +212,63 @@ class WithdrawCommandServiceImplTest {
                         assertThat(response.data().getWithdrawAmount()).isEqualTo(150000L);
 
                         verify(redisService, atLeastOnce()).deleteReactive(anyString());
+                }
+
+                @Test
+                @DisplayName("should reject withdraw when ai-security denies and not debit")
+                void create_DeniedBySecurity() {
+                        CreateWithdrawRequest req = createValidCreateRequest();
+
+                        when(cardPort.findUserCardByCardNumber(any()))
+                                        .thenReturn(Uni.createFrom().item(cardWithEmail()));
+                        when(fraudPort.verifySecurity(any(), any(), anyDouble()))
+                                        .thenReturn(Uni.createFrom().item(new FraudPort.SecurityResult(
+                                                        false, 0.9, "Critical risk detected", "DENY")));
+
+                        ApiResponse<WithdrawResponse> response = service.create(req).await().indefinitely();
+
+                        assertThat(response).isNotNull();
+                        assertThat(response.status()).isEqualTo("error");
+                        assertThat(response.data()).isNull();
+                        verify(saldoPort, org.mockito.Mockito.never()).updateSaldoWithdraw(any());
+                }
+
+                @Test
+                @DisplayName("should fail open and succeed when ai-security is unreachable")
+                void create_SecurityUnreachable_FailsOpen() {
+                        CreateWithdrawRequest req = createValidCreateRequest();
+
+                        when(cardPort.findUserCardByCardNumber(any()))
+                                        .thenReturn(Uni.createFrom().item(cardWithEmail()));
+                        when(fraudPort.verifySecurity(any(), any(), anyDouble()))
+                                        .thenReturn(Uni.createFrom()
+                                                        .failure(io.grpc.Status.UNAVAILABLE.asRuntimeException()));
+                        when(saldoPort.findByCardNumber(any()))
+                                        .thenReturn(Uni.createFrom().item(saldo(500000)));
+                        when(saldoPort.updateSaldoWithdraw(any()))
+                                        .thenReturn(Uni.createFrom()
+                                                        .item(new SaldoMutationResult("99", CARD_NUMBER, 350000)));
+
+                        when(withdrawCommandRepo.persist(any(Withdraw.class)))
+                                        .thenAnswer(inv -> {
+                                                Withdraw w = inv.getArgument(0);
+                                                if (w.getWithdrawId() == null) {
+                                                        w.setWithdrawId(WITHDRAW_ID);
+                                                }
+                                                return Uni.createFrom().item(w);
+                                        });
+                        when(withdrawCommandRepo.updateStatus(any(), anyString()))
+                                        .thenAnswer(inv -> Uni.createFrom().item(
+                                                        createTestWithdraw(WITHDRAW_ID, CARD_NUMBER, 150000L,
+                                                                        Status.SUCCESS)));
+                        lenient().when(kafkaService.sendMessage(anyString(), anyString(), any()))
+                                        .thenReturn(Uni.createFrom().voidItem());
+
+                        ApiResponse<WithdrawResponse> response = service.create(req).await().indefinitely();
+
+                        assertThat(response).isNotNull();
+                        assertThat(response.status()).isEqualTo("success");
+                        verify(saldoPort, atLeastOnce()).updateSaldoWithdraw(any());
                 }
         }
 

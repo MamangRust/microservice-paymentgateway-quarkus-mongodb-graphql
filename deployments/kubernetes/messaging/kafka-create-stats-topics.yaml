@@ -1,0 +1,36 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kafka-create-stats-topics
+  namespace: payment-gateway
+spec:
+  template:
+    spec:
+      serviceAccountName: app
+      automountServiceAccountToken: false
+      restartPolicy: OnFailure
+      containers:
+        - name: kafka-topic-init
+          image: apache/kafka:4.3.1
+          command:
+            - /bin/sh
+            - -c
+            - |
+              echo "Creating stats Kafka topics..."
+              for topic in \
+                stats.payment.transaction.event \
+                stats.payment.topup.event \
+                stats.payment.transfer.event \
+                stats.payment.withdraw.event \
+                stats.payment.saldo.event \
+                stats.payment.merchant.event \
+                stats.payment.card.event; do
+                kafka-topics.sh \
+                  --bootstrap-server kafka.payment-gateway.svc.cluster.local:9092 \
+                  --create \
+                  --if-not-exists \
+                  --replication-factor 1 \
+                  --partitions 1 \
+                  --topic "$topic"
+              done
+              echo "All stats topics created (or already exist)."

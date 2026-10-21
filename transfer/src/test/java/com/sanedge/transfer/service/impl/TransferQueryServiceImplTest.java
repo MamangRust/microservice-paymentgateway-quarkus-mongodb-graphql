@@ -3,6 +3,7 @@ package com.sanedge.transfer.service.impl;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyDouble;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.atLeastOnce;
@@ -23,6 +24,7 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
 import com.sanedge.common.adapter.card.CardPort;
+import com.sanedge.common.adapter.fraud.FraudPort;
 import com.sanedge.common.adapter.model.Card;
 import com.sanedge.common.adapter.model.Saldo;
 import com.sanedge.common.adapter.model.SaldoMutationResult;
@@ -63,6 +65,9 @@ class TransferCommandServiceImplTest {
         private SaldoPort saldoPort;
 
         @Mock
+        private FraudPort fraudPort;
+
+        @Mock
         private Validator validator;
 
         @Mock
@@ -82,11 +87,17 @@ class TransferCommandServiceImplTest {
                                 transferCommandRepo,
                                 cardPort,
                                 saldoPort,
+                                fraudPort,
                                 transferQueryRepo,
                                 validator,
                                 redisService,
                                 kafkaService,
                                 tracingMetrics);
+
+                // Default: security verification allows the transfer.
+                lenient().when(fraudPort.verifySecurity(any(), any(), anyDouble()))
+                                .thenReturn(Uni.createFrom().item(
+                                                new FraudPort.SecurityResult(true, 0.1, "ok", "ALLOW")));
 
                 lenient().doAnswer(invocation -> {
                         Supplier<Uni<?>> supplier = invocation.getArgument(3);
@@ -198,6 +209,53 @@ class TransferCommandServiceImplTest {
                         assertThat(response.data().getId()).isEqualTo(ID);
 
                         verify(redisService, atLeastOnce()).deleteReactive(anyString());
+                }
+
+                @Test
+                @DisplayName("should reject transfer when ai-security denies and not move balance")
+                void create_DeniedBySecurity() {
+                        CreateTransferRequest req = createValidCreateRequest();
+                        mockCardAndSaldoServices();
+                        when(fraudPort.verifySecurity(any(), any(), anyDouble()))
+                                        .thenReturn(Uni.createFrom().item(new FraudPort.SecurityResult(
+                                                        false, 0.9, "Critical risk detected", "DENY")));
+
+                        ApiResponse<TransferResponse> response = service.create(req).await().indefinitely();
+
+                        assertThat(response).isNotNull();
+                        assertThat(response.status()).isEqualTo("error");
+                        assertThat(response.data()).isNull();
+                        verify(saldoPort, org.mockito.Mockito.never()).updateSaldoBalance(any());
+                }
+
+                @Test
+                @DisplayName("should fail open and succeed when ai-security is unreachable")
+                void create_SecurityUnreachable_FailsOpen() {
+                        CreateTransferRequest req = createValidCreateRequest();
+                        mockCardAndSaldoServices();
+                        when(fraudPort.verifySecurity(any(), any(), anyDouble()))
+                                        .thenReturn(Uni.createFrom()
+                                                        .failure(io.grpc.Status.UNAVAILABLE.asRuntimeException()));
+
+                        when(transferCommandRepo.persist(any(Transfer.class)))
+                                        .thenAnswer(inv -> {
+                                                Transfer t = inv.getArgument(0);
+                                                if (t.getTransferId() == null)
+                                                        t.setTransferId(ID);
+                                                return Uni.createFrom().item(t);
+                                        });
+                        when(transferCommandRepo.updateTransferStatus(anyString(), anyString()))
+                                        .thenAnswer(inv -> {
+                                                String id = inv.getArgument(0);
+                                                return Uni.createFrom().item(createTestTransfer(id, "111122223333",
+                                                                "444455556666", 150000, Status.SUCCESS));
+                                        });
+
+                        ApiResponse<TransferResponse> response = service.create(req).await().indefinitely();
+
+                        assertThat(response).isNotNull();
+                        assertThat(response.status()).isEqualTo("success");
+                        verify(saldoPort, atLeastOnce()).updateSaldoBalance(any());
                 }
 
                 @SuppressWarnings({"unchecked", "rawtypes"})

@@ -19,6 +19,8 @@ import com.sanedge.transaction.entity.Transaction;
 import com.sanedge.common.enums.Status;
 import com.sanedge.common.exception.ResourceNotFoundException;
 import com.sanedge.common.adapter.card.CardPort;
+import com.sanedge.common.adapter.fraud.FraudFallback;
+import com.sanedge.common.adapter.fraud.FraudPort;
 import com.sanedge.common.adapter.merchant.MerchantPort;
 import com.sanedge.common.adapter.model.Card;
 import com.sanedge.common.adapter.model.Merchant;
@@ -26,6 +28,8 @@ import com.sanedge.common.adapter.model.Saldo;
 import com.sanedge.common.adapter.saldo.SaldoPort;
 import com.sanedge.transaction.service.KafkaService;
 import io.vertx.core.json.JsonObject;
+import com.sanedge.transaction.entity.Outbox;
+import com.sanedge.transaction.repository.OutboxRepository;
 import com.sanedge.transaction.repository.TransactionCommandRepository;
 import com.sanedge.transaction.repository.TransactionQueryRepository;
 import com.sanedge.transaction.service.TransactionCommandService;
@@ -56,9 +60,17 @@ public class TransactionCommandServiceImpl implements TransactionCommandService 
         private final MerchantPort merchantPort;
         private final SaldoPort saldoPort;
         private final CardPort cardPort;
+        private final FraudPort fraudPort;
         private final Validator validator;
         private final RedisService redisService;
         private final KafkaService kafkaService;
+
+        /**
+         * Transactional outbox for the stats pipeline. Field-injected (not part of
+         * the constructor) so existing unit-test constructors keep compiling.
+         */
+        @Inject
+        OutboxRepository outboxRepository;
 
         private final Tracer tracer;
         private final LongCounter requestsTotal;
@@ -70,6 +82,7 @@ public class TransactionCommandServiceImpl implements TransactionCommandService 
                         MerchantPort merchantPort,
                         SaldoPort saldoPort,
                         CardPort cardPort,
+                        FraudPort fraudPort,
                         Validator validator,
                         RedisService redisService,
                         KafkaService kafkaService,
@@ -79,6 +92,7 @@ public class TransactionCommandServiceImpl implements TransactionCommandService 
                 this.merchantPort = merchantPort;
                 this.saldoPort = saldoPort;
                 this.cardPort = cardPort;
+                this.fraudPort = fraudPort;
                 this.validator = validator;
                 this.redisService = redisService;
                 this.kafkaService = kafkaService;
@@ -115,6 +129,40 @@ public class TransactionCommandServiceImpl implements TransactionCommandService 
                                         key4 != null ? redisService.deleteReactive(key4) : Uni.createFrom().voidItem())
                                         .discardItems();
                 }
+        }
+
+        /**
+         * Emits {@code stats.payment.transaction.event} through the transactional
+         * outbox so the ClickHouse stats pipeline has a producer. Failure-isolated:
+         * a stats hiccup must never fail transaction creation. Payload fields match
+         * the {@code payment_stats.transaction_events} columns; ids are ObjectId hex
+         * strings.
+         */
+        private Uni<Void> enqueueTransactionStatsEvent(Transaction tx) {
+                if (outboxRepository == null) {
+                        return Uni.createFrom().voidItem();
+                }
+                JsonObject payload = new JsonObject()
+                                .put("transaction_id", tx.getTransactionId() != null ? tx.getTransactionId() : "")
+                                .put("transaction_no", tx.transactionNo != null ? tx.transactionNo.toString() : "")
+                                .put("card_number", tx.cardNumber != null ? tx.cardNumber : "")
+                                .put("amount", tx.amount != null ? tx.amount : 0)
+                                .put("payment_method", tx.paymentMethod != null ? tx.paymentMethod : "")
+                                .put("merchant_id", tx.merchantId != null ? tx.merchantId.toHexString() : "")
+                                .put("status", tx.status != null ? tx.status.name().toLowerCase() : "");
+
+                JsonObject envelope = com.sanedge.common.event.EventEnvelope
+                                .withDefaults(payload, "stats.payment.transaction.event");
+
+                Outbox outbox = new Outbox();
+                outbox.setDomain("transaction");
+                outbox.setEventId(UUID.randomUUID().toString());
+                outbox.setEventKey(tx.getTransactionId());
+                outbox.setTopic("stats.payment.transaction.event");
+                outbox.setPayload(envelope.encode());
+                outbox.setStatus("PENDING");
+                return outboxRepository.persist(outbox).replaceWithVoid()
+                                .onFailure().recoverWithItem((Void) null);
         }
 
         private <T> void validateRequest(T req) {
@@ -173,6 +221,33 @@ public class TransactionCommandServiceImpl implements TransactionCommandService 
                                                                                         Transaction transactionEntity = new Transaction();
                                                                                         UUID transactionNo = UUID
                                                                                                         .randomUUID();
+
+                                                                                        // Fraud gate: score before any balance is debited.
+                                                                                        // Fail-open when ai-security is unreachable; a
+                                                                                        // fraudulent verdict rejects the transaction.
+                                                                                        int userId = card.userId() != null
+                                                                                                        ? card.userId().hashCode()
+                                                                                                        : 0;
+                                                                                        return FraudFallback.detectFraud(fraudPort,
+                                                                                                        new FraudPort.FraudCheck(
+                                                                                                                        transactionNo.toString(),
+                                                                                                                        0,
+                                                                                                                        userId,
+                                                                                                                        req.getAmount().doubleValue(),
+                                                                                                                        "IDR",
+                                                                                                                        req.getPaymentMethod(),
+                                                                                                                        null,
+                                                                                                                        null,
+                                                                                                                        Instant.now().toEpochMilli()))
+                                                                                                        .chain(fraud -> {
+                                                                                                                if (fraud.fraudulent()) {
+                                                                                                                        logger.warn(
+                                                                                                                                        "🚫 Transaction {} flagged as fraudulent: {}",
+                                                                                                                                        transactionNo, fraud.reason());
+                                                                                                                        return Uni.createFrom()
+                                                                                                                                        .failure(new ResourceNotFoundException(
+                                                                                                                                                        "Transaction flagged as fraudulent"));
+                                                                                                                }
 
                                                                                         transactionEntity.setCardNumber(
                                                                                                         req.getCardNumber());
@@ -246,7 +321,7 @@ public class TransactionCommandServiceImpl implements TransactionCommandService 
                                                                                                                                              .onFailure().recoverWithNull();
                                                                                                                      }
 
-                                                                                                                     return emailUni.map(v4 -> {
+                                                                                                                     return emailUni.chain(v4 -> enqueueTransactionStatsEvent(updatedTx)).map(v4 -> {
                                                                                                                              TransactionResponse response = TransactionResponse
                                                                                                                                              .from(updatedTx);
                                                                                                                              logger.info(
@@ -279,6 +354,7 @@ public class TransactionCommandServiceImpl implements TransactionCommandService 
                                                                                                         });
                                                                                 });
                                                         });
+                                                });
                                 })
                                 .onFailure().recoverWithItem(e -> {
                                         logger.error("🔥 Error in create transaction: {}", e.getMessage(), e);

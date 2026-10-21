@@ -16,6 +16,8 @@ import com.sanedge.common.domain.response.ApiResponse;
 import com.sanedge.merchant.domain.response.MerchantResponse;
 import com.sanedge.merchant.domain.response.MerchantResponseDeleteAt;
 import com.sanedge.merchant.entity.Merchant;
+import com.sanedge.merchant.entity.Outbox;
+import com.sanedge.merchant.repository.OutboxRepository;
 import com.sanedge.common.enums.Status;
 import com.sanedge.common.exception.ResourceAlreadyExistsException;
 import com.sanedge.common.exception.ResourceNotFoundException;
@@ -26,6 +28,7 @@ import com.sanedge.common.utils.ApiKeyGenerator;
 
 import io.opentelemetry.api.common.Attributes;
 import io.smallrye.mutiny.Uni;
+import io.vertx.core.json.JsonObject;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 
@@ -39,6 +42,10 @@ public class MerchantCommandServiceImpl implements MerchantCommandService {
     private final RedisService redisService;
     private final TracingMetrics tracingMetrics;
 
+    /** Transactional outbox for the stats pipeline (field-injected to keep test constructors stable). */
+    @Inject
+    OutboxRepository outboxRepository;
+
     @Inject
     public MerchantCommandServiceImpl(
                     UserPort userPort,
@@ -51,6 +58,36 @@ public class MerchantCommandServiceImpl implements MerchantCommandService {
         this.merchantCommandRepository = merchantCommandRepository;
         this.redisService = redisService;
         this.tracingMetrics = tracingMetrics;
+    }
+
+    /**
+     * Emits {@code stats.payment.merchant.event} through the transactional outbox
+     * so the ClickHouse stats pipeline has a producer. Failure-isolated: a stats
+     * hiccup must never fail the merchant write. Payload fields match the
+     * {@code payment_stats.merchant_events} columns; ids are ObjectId hex strings.
+     */
+    private Uni<Void> enqueueMerchantStatsEvent(Merchant merchant) {
+        if (outboxRepository == null) {
+            return Uni.createFrom().voidItem();
+        }
+        JsonObject payload = new JsonObject()
+                .put("merchant_id", merchant.getMerchantId() != null ? merchant.getMerchantId() : "")
+                .put("user_id", merchant.userId != null ? merchant.userId.toHexString() : "")
+                .put("name", merchant.name != null ? merchant.name : "")
+                .put("status", merchant.status != null ? merchant.status.name().toLowerCase() : "");
+
+        JsonObject envelope = com.sanedge.common.event.EventEnvelope
+                .withDefaults(payload, "stats.payment.merchant.event");
+
+        Outbox outbox = new Outbox();
+        outbox.setDomain("merchant");
+        outbox.setEventId(java.util.UUID.randomUUID().toString());
+        outbox.setEventKey(merchant.getMerchantId());
+        outbox.setTopic("stats.payment.merchant.event");
+        outbox.setPayload(envelope.encode());
+        outbox.setStatus("PENDING");
+        return outboxRepository.persist(outbox).replaceWithVoid()
+                .onFailure().recoverWithItem((Void) null);
     }
 
     @Override
@@ -87,8 +124,8 @@ public class MerchantCommandServiceImpl implements MerchantCommandService {
                                                         return merchantCommandRepository.persist(merchant)
                                                                         .chain(savedMerchant -> {
                                                                                 logger.info("✅ Merchant created successfully | Id: {}, ApiKey: {}", merchant.getMerchantId(), apiKey);
-                                                                                return Uni.createFrom()
-                                                                                                .item(ApiResponse.success("Merchant created successfully", MerchantResponse.from(merchant)));
+                                                                                return enqueueMerchantStatsEvent(merchant)
+                                                                                                .replaceWith(ApiResponse.success("Merchant created successfully", MerchantResponse.from(merchant)));
                                                                         });
                                                 });
                         }).onFailure().recoverWithItem(e -> {
@@ -139,7 +176,9 @@ public class MerchantCommandServiceImpl implements MerchantCommandService {
                                                                                                         redisService.deleteReactive(cacheIdKey),
                                                                                                         redisService.deleteReactive(cacheApiKey),
                                                                                                         redisService.deleteReactive(cacheUserKey))
-                                                                                                        .asTuple().map(v2 -> {
+                                                                                                        .asTuple()
+                                                                                                        .chain(t -> enqueueMerchantStatsEvent(merchant))
+                                                                                                        .map(v2 -> {
                                                                                                                 logger.info("✅ Merchant updated successfully | Id: {}", req.getMerchantId());
                                                                                                                 return ApiResponse.success("Merchant updated successfully",
                                                                                                                                 MerchantResponse.from(merchant));

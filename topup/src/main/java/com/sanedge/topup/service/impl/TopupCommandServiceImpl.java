@@ -14,6 +14,8 @@ import com.sanedge.common.domain.response.ApiResponse;
 import com.sanedge.topup.domain.response.TopupResponse;
 import com.sanedge.topup.domain.response.TopupResponseDeleteAt;
 import com.sanedge.topup.entity.Topup;
+import com.sanedge.topup.entity.Outbox;
+import com.sanedge.topup.repository.OutboxRepository;
 import com.sanedge.common.enums.Status;
 import com.sanedge.common.exception.InvalidRequestException;
 import com.sanedge.common.exception.ResourceNotFoundException;
@@ -55,6 +57,10 @@ public class TopupCommandServiceImpl implements TopupCommandService {
     private final Validator validator;
     private final RedisService redisService;
     private final KafkaService kafkaService;
+
+    /** Transactional outbox for the stats pipeline (field-injected to keep test constructors stable). */
+    @Inject
+    OutboxRepository outboxRepository;
 
     private final Tracer tracer;
     private final LongCounter requestsTotal;
@@ -101,6 +107,38 @@ public class TopupCommandServiceImpl implements TopupCommandService {
         this(cardPort, saldoPort,
                 topupQueryRepository, topupCommandRepository, validator,
                 OpenTelemetry.noop(), redisService, kafkaService);
+    }
+
+    /**
+     * Emits {@code stats.payment.topup.event} through the transactional outbox so
+     * the ClickHouse stats pipeline has a producer. Failure-isolated: a stats
+     * hiccup must never fail topup creation. Payload fields match the
+     * {@code payment_stats.topup_events} columns; ids are ObjectId hex strings.
+     */
+    private Uni<Void> enqueueTopupStatsEvent(Topup topup) {
+        if (outboxRepository == null) {
+            return Uni.createFrom().voidItem();
+        }
+        JsonObject payload = new JsonObject()
+                .put("topup_id", topup.getTopupId() != null ? topup.getTopupId() : "")
+                .put("topup_no", topup.topupNo != null ? topup.topupNo.toString() : "")
+                .put("card_number", topup.cardNumber != null ? topup.cardNumber : "")
+                .put("amount", topup.topupAmount != null ? topup.topupAmount : 0)
+                .put("payment_method", topup.topupMethod != null ? topup.topupMethod : "")
+                .put("status", topup.status != null ? topup.status.name().toLowerCase() : "");
+
+        JsonObject envelope = com.sanedge.common.event.EventEnvelope
+                .withDefaults(payload, "stats.payment.topup.event");
+
+        Outbox outbox = new Outbox();
+        outbox.setDomain("topup");
+        outbox.setEventId(UUID.randomUUID().toString());
+        outbox.setEventKey(topup.getTopupId());
+        outbox.setTopic("stats.payment.topup.event");
+        outbox.setPayload(envelope.encode());
+        outbox.setStatus("PENDING");
+        return outboxRepository.persist(outbox).replaceWithVoid()
+                .onFailure().recoverWithItem((Void) null);
     }
 
     private <T> boolean validateRequest(T req) {
@@ -199,7 +237,7 @@ public class TopupCommandServiceImpl implements TopupCommandService {
                                                                         .onFailure().recoverWithNull();
                                                             }
 
-                                                            return emailUni.map(v -> {
+                                                            return emailUni.chain(v -> enqueueTopupStatsEvent(updatedTopup)).map(v -> {
                                                                 span.setStatus(StatusCode.OK);
                                                                 requestsTotal.add(1, Attributes.of(
                                                                         AttributeKey.stringKey("operation"), "create_topup",

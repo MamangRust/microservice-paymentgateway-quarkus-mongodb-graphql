@@ -4,6 +4,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.lenient;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -20,6 +21,7 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
 import com.sanedge.common.adapter.card.CardPort;
+import com.sanedge.common.adapter.fraud.FraudPort;
 import com.sanedge.common.adapter.merchant.MerchantPort;
 import com.sanedge.common.adapter.model.Card;
 import com.sanedge.common.adapter.model.Merchant;
@@ -62,6 +64,9 @@ class TransactionCommandServiceImplTest {
     CardPort cardPort;
 
     @Mock
+    FraudPort fraudPort;
+
+    @Mock
     MerchantPort merchantPort;
 
     @Mock
@@ -100,6 +105,7 @@ class TransactionCommandServiceImplTest {
                 merchantPort,
                 saldoPort,
                 cardPort,
+                fraudPort,
                 validator,
                 redisService,
                 kafkaService,
@@ -129,6 +135,11 @@ class TransactionCommandServiceImplTest {
 
         // Validator passes by default
         lenient().when(validator.validate(any())).thenReturn(Set.of());
+
+        // ai-security allows by default (fail-open default verdict).
+        lenient().when(fraudPort.detectFraud(any()))
+                .thenReturn(Uni.createFrom().item(
+                        new FraudPort.FraudResult(null, 0.1, false, "Normal transaction")));
 
         // Redis cache-miss by default
         lenient().when(redisService.getReactive(anyString())).thenReturn(Uni.createFrom().nullItem());
@@ -198,6 +209,91 @@ class TransactionCommandServiceImplTest {
         assertThat(result.status()).isEqualTo("success");
         assertThat(result.data()).isNotNull();
         assertThat(result.data().getCardNumber()).isEqualTo("4111111111111111");
+        verify(transactionCommandRepository, times(1)).persist(any(com.sanedge.transaction.entity.Transaction.class));
+    }
+
+    @Test
+    void createTransaction_fraudulent_rejectsAndDoesNotDebit() {
+        when(merchantPort.findByApiKey(any())).thenReturn(Uni.createFrom().item(merchant()));
+
+        when(cardPort.findUserCardByCardNumber(any()))
+                .thenReturn(Uni.createFrom().item(card("4111111111111111", "test@example.com")));
+
+        when(saldoPort.findByCardNumber(any()))
+                .thenReturn(Uni.createFrom().item(saldo(500000)));
+
+        // ai-security flags the transaction as fraudulent.
+        when(fraudPort.detectFraud(any()))
+                .thenReturn(Uni.createFrom().item(
+                        new FraudPort.FraudResult("tx", 0.95, true, "Irregular pattern detected")));
+
+        CreateTransactionRequest req = new CreateTransactionRequest();
+        req.setCardNumber("4111111111111111");
+        req.setAmount(150000L);
+        req.setPaymentMethod("CREDIT_CARD");
+        req.setMerchantId(MERCHANT_ID);
+
+        ApiResponse<TransactionResponse> result = transactionCommandService.create("test-api-key", req)
+                .await().indefinitely();
+
+        assertThat(result.status()).isEqualTo("error");
+        assertThat(result.data()).isNull();
+        // Balance must not move and nothing is persisted.
+        verify(saldoPort, never()).updateSaldoBalance(any());
+        verify(transactionCommandRepository, never())
+                .persist(any(com.sanedge.transaction.entity.Transaction.class));
+    }
+
+    @Test
+    void createTransaction_aiSecurityUnreachable_failsOpenAndSucceeds() {
+        when(merchantPort.findByApiKey(any())).thenReturn(Uni.createFrom().item(merchant()));
+
+        when(cardPort.findUserCardByCardNumber(any()))
+                .thenReturn(Uni.createFrom().item(card("4111111111111111", "test@example.com")));
+
+        when(saldoPort.findByCardNumber(any()))
+                .thenReturn(Uni.createFrom().item(saldo(500000)));
+
+        when(saldoPort.updateSaldoBalance(any()))
+                .thenReturn(Uni.createFrom().item(new SaldoMutationResult(SALDO_ID, "4111111111111111", 350000)));
+
+        when(transactionCommandRepository.persist(any(com.sanedge.transaction.entity.Transaction.class)))
+                .thenAnswer(inv -> {
+                    Transaction t = inv.getArgument(0);
+                    t.setTransactionId(ID);
+                    return Uni.createFrom().item(t);
+                });
+
+        when(transactionCommandRepository.updateTransactionStatus(anyString(), anyString()))
+                .thenAnswer(inv -> {
+                    transaction.setTransactionId(ID);
+                    transaction.status = Status.SUCCESS;
+                    return Uni.createFrom().item(transaction);
+                });
+
+        when(cardPort.findCardByUserId(any()))
+                .thenReturn(Uni.createFrom().item(card("2222222222222222", null)));
+
+        when(kafkaService.sendMessage(anyString(), anyString(), any(JsonObject.class)))
+                .thenReturn(Uni.createFrom().voidItem());
+
+        // ai-security is unreachable.
+        when(fraudPort.detectFraud(any()))
+                .thenReturn(Uni.createFrom().failure(io.grpc.Status.UNAVAILABLE.asRuntimeException()));
+
+        CreateTransactionRequest req = new CreateTransactionRequest();
+        req.setCardNumber("4111111111111111");
+        req.setAmount(150000L);
+        req.setPaymentMethod("CREDIT_CARD");
+        req.setMerchantId(MERCHANT_ID);
+
+        ApiResponse<TransactionResponse> result = transactionCommandService.create("test-api-key", req)
+                .await().indefinitely();
+
+        assertThat(result.status()).isEqualTo("success");
+        assertThat(result.data()).isNotNull();
+        // Sender debit + merchant credit.
+        verify(saldoPort, times(2)).updateSaldoBalance(any());
         verify(transactionCommandRepository, times(1)).persist(any(com.sanedge.transaction.entity.Transaction.class));
     }
 

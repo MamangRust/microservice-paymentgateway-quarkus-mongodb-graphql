@@ -69,6 +69,13 @@ data:
   GRPC_TRANSFER_PORT: "50059"
   GRPC_WITHDRAW_PORT: "50060"
 
+  # ai-security client (Python gRPC server on 50051) consumed by
+  # transaction (DetectFraud), withdraw and transfer (VerifySecurity).
+  GRPC_CLIENT_AI_SECURITY_HOST: "ai-security.payment-gateway.svc.cluster.local"
+  GRPC_CLIENT_AI_SECURITY_PORT: "50051"
+  AI_SECURITY_HOST: "ai-security.payment-gateway.svc.cluster.local"
+  AI_SECURITY_PORT: "50051"
+
   METRIC_EMAIL_ADDR: "8080"
   METRIC_AUTH_ADDR: "8081"
   METRIC_ROLE_ADDR: "8082"

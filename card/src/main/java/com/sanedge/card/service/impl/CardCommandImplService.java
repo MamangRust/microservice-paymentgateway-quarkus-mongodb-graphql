@@ -13,12 +13,14 @@ import com.sanedge.common.domain.response.ApiResponse;
 import com.sanedge.card.domain.response.CardResponse;
 import com.sanedge.card.domain.response.CardResponseDeleteAt;
 import com.sanedge.card.entity.Card;
+import com.sanedge.card.entity.Outbox;
 import com.sanedge.common.exception.InvalidRequestException;
 import com.sanedge.common.exception.ResourceNotFoundException;
 import com.sanedge.card.service.KafkaService;
 import io.vertx.core.json.JsonObject;
 import com.sanedge.card.repository.CardCommandRepository;
 import com.sanedge.card.repository.CardQueryRepository;
+import com.sanedge.card.repository.OutboxRepository;
 import com.sanedge.card.service.CardCommandService;
 import com.sanedge.common.utils.CardNumberGenerator;
 import com.sanedge.common.observability.TracingMetrics;
@@ -44,6 +46,10 @@ public class CardCommandImplService implements CardCommandService {
 
     @Inject
     KafkaService kafkaService;
+
+    /** Transactional outbox for the stats pipeline. */
+    @Inject
+    OutboxRepository outboxRepository;
 
     @Inject
     Validator validator;
@@ -93,6 +99,7 @@ public class CardCommandImplService implements CardCommandService {
                                         "saldo-service-topic-create-saldo",
                                         savedCard.getCardNumber(),
                                         saldoPayload)
+                                        .chain(v -> enqueueCardStatsEvent(savedCard))
                                         .map(v -> savedCard);
                             })
                             .map(savedCard -> {
@@ -145,8 +152,9 @@ public class CardCommandImplService implements CardCommandService {
                     card.setUpdatedAt(Instant.now());
 
                     return cardCommandRepository.update(card)
-                            .map(updatedCard -> {
-                                CardResponse response = CardResponse.from(updatedCard);
+                            .chain(x -> enqueueCardStatsEvent(card))
+                            .map(x -> {
+                                CardResponse response = CardResponse.from(card);
                                 logger.info("✅ Card updated successfully with card_id={}", response.getId());
                                 return new ApiResponse<>("success", "Card updated successfully", response);
                             });
@@ -243,6 +251,38 @@ public class CardCommandImplService implements CardCommandService {
                     logger.error("💥 Failed to delete all cards", e);
                     return new ApiResponse<>("error", "Failed to delete all cards", false);
                 });
+    }
+
+    /**
+     * Emits {@code stats.payment.card.event} through the transactional outbox so
+     * the ClickHouse stats pipeline has a producer. Failure-isolated: a stats
+     * hiccup must never fail the card write. Payload fields match the
+     * {@code payment_stats.card_events} columns; ids are ObjectId hex strings.
+     */
+    private Uni<Void> enqueueCardStatsEvent(Card card) {
+        if (outboxRepository == null) {
+            return Uni.createFrom().voidItem();
+        }
+        JsonObject payload = new JsonObject()
+                .put("card_id", card.getCardId() != null ? card.getCardId() : "")
+                .put("user_id", card.userId != null ? card.userId.toHexString() : "")
+                .put("card_number", card.cardNumber != null ? card.cardNumber : "")
+                .put("card_type", card.cardType != null ? card.cardType : "")
+                .put("card_provider", card.cardProvider != null ? card.cardProvider : "")
+                .put("status", card.status != null ? card.status.name().toLowerCase() : "");
+
+        JsonObject envelope = com.sanedge.common.event.EventEnvelope
+                .withDefaults(payload, "stats.payment.card.event");
+
+        Outbox outbox = new Outbox();
+        outbox.setDomain("card");
+        outbox.setEventId(java.util.UUID.randomUUID().toString());
+        outbox.setEventKey(card.getCardId());
+        outbox.setTopic("stats.payment.card.event");
+        outbox.setPayload(envelope.encode());
+        outbox.setStatus("PENDING");
+        return outboxRepository.persist(outbox).replaceWithVoid()
+                .onFailure().recoverWithItem((Void) null);
     }
 
     private <T> boolean validateRequest(T req) {

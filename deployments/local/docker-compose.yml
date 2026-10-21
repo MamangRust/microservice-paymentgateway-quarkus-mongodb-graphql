@@ -540,6 +540,8 @@ services:
         condition: service_started
       redis-cluster-init:
         condition: service_completed_successfully
+      ai-security:
+        condition: service_started
 
   transfer:
     image: microservice-payment-gateway-grpc/transfer:latest
@@ -565,6 +567,8 @@ services:
         condition: service_started
       redis-cluster-init:
         condition: service_completed_successfully
+      ai-security:
+        condition: service_started
 
   user:
     image: microservice-payment-gateway-grpc/user:latest
@@ -635,6 +639,8 @@ services:
         condition: service_started
       redis-cluster-init:
         condition: service_completed_successfully
+      ai-security:
+        condition: service_started
 
   stats-reader:
     image: microservice-payment-gateway-grpc/stats-reader:latest

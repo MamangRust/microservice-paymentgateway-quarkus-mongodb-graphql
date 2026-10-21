@@ -17,6 +17,8 @@ import com.sanedge.transfer.domain.requests.UpdateTransferRequest;
 import com.sanedge.transfer.domain.response.TransferResponse;
 import com.sanedge.transfer.domain.response.TransferResponseDeleteAt;
 import com.sanedge.transfer.entity.Transfer;
+import com.sanedge.transfer.entity.Outbox;
+import com.sanedge.transfer.repository.OutboxRepository;
 import com.sanedge.transfer.repository.TransferCommandRepository;
 import com.sanedge.transfer.repository.TransferQueryRepository;
 import com.sanedge.transfer.service.TransferCommandService;
@@ -28,6 +30,8 @@ import jakarta.inject.Inject;
 import jakarta.validation.ConstraintViolation;
 import jakarta.validation.Validator;
 import com.sanedge.common.adapter.card.CardPort;
+import com.sanedge.common.adapter.fraud.FraudFallback;
+import com.sanedge.common.adapter.fraud.FraudPort;
 import com.sanedge.common.adapter.model.Card;
 import com.sanedge.common.adapter.model.Saldo;
 import com.sanedge.common.adapter.saldo.SaldoPort;
@@ -41,16 +45,22 @@ public class TransferCommandServiceImpl implements TransferCommandService {
     private final TransferCommandRepository transferCommandRepository;
     private final CardPort cardPort;
     private final SaldoPort saldoPort;
+    private final FraudPort fraudPort;
     private final TransferQueryRepository transferQueryRepository;
     private final Validator validator;
     private final RedisService redisService;
     private final KafkaService kafkaService;
     private final TracingMetrics tracingMetrics;
 
+    /** Transactional outbox for the stats pipeline (field-injected to keep test constructors stable). */
+    @Inject
+    OutboxRepository outboxRepository;
+
     @Inject
     public TransferCommandServiceImpl(TransferCommandRepository transferCommandRepository,
             CardPort cardPort,
             SaldoPort saldoPort,
+            FraudPort fraudPort,
             TransferQueryRepository transferQueryRepository,
             Validator validator,
             RedisService redisService,
@@ -59,6 +69,7 @@ public class TransferCommandServiceImpl implements TransferCommandService {
         this.transferCommandRepository = transferCommandRepository;
         this.cardPort = cardPort;
         this.saldoPort = saldoPort;
+        this.fraudPort = fraudPort;
         this.transferQueryRepository = transferQueryRepository;
         this.validator = validator;
         this.redisService = redisService;
@@ -117,8 +128,21 @@ public class TransferCommandServiceImpl implements TransferCommandService {
                     .findUserCardByCardNumber(req.getTransferFrom())
                     .chain(senderCard -> {
                         senderEmailContainer[0] = senderCard.email();
-                        return cardPort.findCardByCardNumber(req.getTransferTo());
+                        // Security gate: verify the transfer domain before money moves.
+                        // Fail-open when ai-security is unreachable; a DENY action rejects.
+                        return FraudFallback.verifySecurity(fraudPort, FraudPort.SecurityDomain.TRANSFER,
+                                        senderCard.userId(), req.getTransferAmount().doubleValue())
+                                .chain(security -> {
+                                    if ("DENY".equals(security.action())) {
+                                        logger.warn("🚫 Transfer from={} denied by ai-security: {}",
+                                                req.getTransferFrom(), security.reason());
+                                        return Uni.createFrom().failure(
+                                                new ResourceNotFoundException("Transfer denied by security policy"));
+                                    }
+                                    return Uni.createFrom().item(senderCard);
+                                });
                     })
+                    .chain(senderCard -> cardPort.findCardByCardNumber(req.getTransferTo()))
                     .chain(receiverCard -> {
                         return saldoPort.findByCardNumber(req.getTransferFrom());
                     })
@@ -187,7 +211,7 @@ public class TransferCommandServiceImpl implements TransferCommandService {
                                                                         .onFailure().recoverWithNull();
                                                             }
 
-                                                            return emailUni.map(v3 -> ApiResponse.success("Transfer created successfully",
+                                                            return emailUni.chain(v3 -> enqueueTransferStatsEvent(updatedTransfer)).map(v3 -> ApiResponse.success("Transfer created successfully",
                                                                     TransferResponse.from(updatedTransfer)));
                                                         });
                                             });
@@ -198,6 +222,38 @@ public class TransferCommandServiceImpl implements TransferCommandService {
                         return new ApiResponse<>("error", "Failed to create transfer: " + e.getMessage(), null);
                     });
         });
+    }
+
+    /**
+     * Emits {@code stats.payment.transfer.event} through the transactional outbox
+     * so the ClickHouse stats pipeline has a producer. Failure-isolated: a stats
+     * hiccup must never fail transfer creation. Payload fields match the
+     * {@code payment_stats.transfer_events} columns; ids are ObjectId hex strings.
+     */
+    private Uni<Void> enqueueTransferStatsEvent(Transfer transfer) {
+        if (outboxRepository == null) {
+            return Uni.createFrom().voidItem();
+        }
+        JsonObject payload = new JsonObject()
+                .put("transfer_id", transfer.getTransferId() != null ? transfer.getTransferId() : "")
+                .put("transfer_no", transfer.transferNo != null ? transfer.transferNo.toString() : "")
+                .put("source_card", transfer.transferFrom != null ? transfer.transferFrom : "")
+                .put("destination_card", transfer.transferTo != null ? transfer.transferTo : "")
+                .put("amount", transfer.transferAmount != null ? transfer.transferAmount : 0)
+                .put("status", transfer.status != null ? transfer.status.name().toLowerCase() : "");
+
+        JsonObject envelope = com.sanedge.common.event.EventEnvelope
+                .withDefaults(payload, "stats.payment.transfer.event");
+
+        Outbox outbox = new Outbox();
+        outbox.setDomain("transfer");
+        outbox.setEventId(UUID.randomUUID().toString());
+        outbox.setEventKey(transfer.getTransferId());
+        outbox.setTopic("stats.payment.transfer.event");
+        outbox.setPayload(envelope.encode());
+        outbox.setStatus("PENDING");
+        return outboxRepository.persist(outbox).replaceWithVoid()
+                .onFailure().recoverWithItem((Void) null);
     }
 
     private static class SaldoPair {

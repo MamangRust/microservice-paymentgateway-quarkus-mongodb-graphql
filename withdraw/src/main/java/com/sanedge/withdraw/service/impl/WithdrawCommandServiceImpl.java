@@ -17,11 +17,15 @@ import com.sanedge.common.domain.response.ApiResponse;
 import com.sanedge.withdraw.domain.response.WithdrawResponse;
 import com.sanedge.withdraw.domain.response.WithdrawResponseDeleteAt;
 import com.sanedge.withdraw.entity.Withdraw;
+import com.sanedge.withdraw.entity.Outbox;
+import com.sanedge.withdraw.repository.OutboxRepository;
 import com.sanedge.common.enums.Status;
 import com.sanedge.common.exception.InvalidRequestException;
 import com.sanedge.common.exception.ResourceNotFoundException;
 import com.sanedge.common.observability.TracingMetrics;
 import com.sanedge.common.adapter.card.CardPort;
+import com.sanedge.common.adapter.fraud.FraudFallback;
+import com.sanedge.common.adapter.fraud.FraudPort;
 import com.sanedge.common.adapter.saldo.SaldoPort;
 import com.sanedge.withdraw.service.KafkaService;
 import io.vertx.core.json.JsonObject;
@@ -45,16 +49,22 @@ public class WithdrawCommandServiceImpl implements WithdrawCommandService {
     private final WithdrawCommandRepository withdrawCommandRepository;
     private final CardPort cardPort;
     private final SaldoPort saldoPort;
+    private final FraudPort fraudPort;
     private final Validator validator;
     private final RedisService redisService;
     private final KafkaService kafkaService;
     private final TracingMetrics tracingMetrics;
+
+    /** Transactional outbox for the stats pipeline (field-injected to keep test constructors stable). */
+    @Inject
+    OutboxRepository outboxRepository;
 
     @Inject
     public WithdrawCommandServiceImpl(WithdrawQueryRepository withdrawQueryRepository,
                                       WithdrawCommandRepository withdrawCommandRepository,
                                       CardPort cardPort,
                                       SaldoPort saldoPort,
+                                      FraudPort fraudPort,
                                       Validator validator,
                                       RedisService redisService,
                                       KafkaService kafkaService,
@@ -63,6 +73,7 @@ public class WithdrawCommandServiceImpl implements WithdrawCommandService {
         this.withdrawCommandRepository = withdrawCommandRepository;
         this.cardPort = cardPort;
         this.saldoPort = saldoPort;
+        this.fraudPort = fraudPort;
         this.validator = validator;
         this.redisService = redisService;
         this.kafkaService = kafkaService;
@@ -71,6 +82,37 @@ public class WithdrawCommandServiceImpl implements WithdrawCommandService {
 
     private static Instant toInstant(LocalDateTime dateTime) {
         return dateTime != null ? dateTime.atZone(ZoneId.systemDefault()).toInstant() : null;
+    }
+
+    /**
+     * Emits {@code stats.payment.withdraw.event} through the transactional outbox
+     * so the ClickHouse stats pipeline has a producer. Failure-isolated: a stats
+     * hiccup must never fail withdraw creation. Payload fields match the
+     * {@code payment_stats.withdraw_events} columns; ids are ObjectId hex strings.
+     */
+    private Uni<Void> enqueueWithdrawStatsEvent(Withdraw withdraw) {
+        if (outboxRepository == null) {
+            return Uni.createFrom().voidItem();
+        }
+        JsonObject payload = new JsonObject()
+                .put("withdraw_id", withdraw.getWithdrawId() != null ? withdraw.getWithdrawId() : "")
+                .put("withdraw_no", withdraw.withdrawNo != null ? withdraw.withdrawNo.toString() : "")
+                .put("card_number", withdraw.cardNumber != null ? withdraw.cardNumber : "")
+                .put("amount", withdraw.withdrawAmount != null ? withdraw.withdrawAmount : 0)
+                .put("status", withdraw.status != null ? withdraw.status.name().toLowerCase() : "");
+
+        JsonObject envelope = com.sanedge.common.event.EventEnvelope
+                .withDefaults(payload, "stats.payment.withdraw.event");
+
+        Outbox outbox = new Outbox();
+        outbox.setDomain("withdraw");
+        outbox.setEventId(UUID.randomUUID().toString());
+        outbox.setEventKey(withdraw.getWithdrawId());
+        outbox.setTopic("stats.payment.withdraw.event");
+        outbox.setPayload(envelope.encode());
+        outbox.setStatus("PENDING");
+        return outboxRepository.persist(outbox).replaceWithVoid()
+                .onFailure().recoverWithItem((Void) null);
     }
 
     private <T> void validateRequest(T req) {
@@ -121,7 +163,19 @@ public class WithdrawCommandServiceImpl implements WithdrawCommandService {
                 cardPort.findUserCardByCardNumber(req.getCardNumber())
                         .chain(card -> {
                             senderEmailContainer[0] = card.email();
-                            return saldoPort.findByCardNumber(req.getCardNumber());
+                            // Security gate: verify the withdraw domain before money moves.
+                            // Fail-open when ai-security is unreachable; a DENY action rejects.
+                            return FraudFallback.verifySecurity(fraudPort, FraudPort.SecurityDomain.WITHDRAW,
+                                            card.userId(), req.getWithdrawAmount().doubleValue())
+                                    .chain(security -> {
+                                        if ("DENY".equals(security.action())) {
+                                            logger.warn("🚫 Withdraw for card={} denied by ai-security: {}",
+                                                    req.getCardNumber(), security.reason());
+                                            return Uni.createFrom().failure(
+                                                    new ResourceNotFoundException("Withdraw denied by security policy"));
+                                        }
+                                        return saldoPort.findByCardNumber(req.getCardNumber());
+                                    });
                         })
                         .chain(saldo -> {
                             if (saldo.totalBalance() < req.getWithdrawAmount()) {
@@ -173,7 +227,7 @@ public class WithdrawCommandServiceImpl implements WithdrawCommandService {
                                                                 .onFailure().recoverWithNull();
                                                     }
 
-                                                    return emailUni.map(v3 -> ApiResponse.success("Created withdraw successfully", WithdrawResponse.from(updatedWithdraw)));
+                                                    return emailUni.chain(v3 -> enqueueWithdrawStatsEvent(updatedWithdraw)).map(v3 -> ApiResponse.success("Created withdraw successfully", WithdrawResponse.from(updatedWithdraw)));
                                                 });
                                     });
                         })

@@ -112,8 +112,43 @@ services:
       retries: 5
       start_period: 60s
 
-  # ─── ClickHouse (analytics / stats) ───────────────────────────────────
-  clickhouse:
+  # ─── Kafka topic bootstrap (one-shot) ─────────────────────────────────
+  # Creates the stats topics the CommandServices now produce into (via the
+  # transactional outbox) and that stats-writer / ai-security consume. Runs once
+  # Kafka is healthy, then exits.
+  kafka-topic-init:
+    image: apache/kafka:4.3.1
+    container_name: e2e-kafka-topic-init
+    networks:
+      - e2e
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        echo "Creating stats Kafka topics..."
+        for topic in \
+          stats.payment.transaction.event \
+          stats.payment.topup.event \
+          stats.payment.transfer.event \
+          stats.payment.withdraw.event \
+          stats.payment.saldo.event \
+          stats.payment.merchant.event \
+          stats.payment.card.event; do
+          kafka-topics.sh \
+            --bootstrap-server kafka:9092 \
+            --create \
+            --if-not-exists \
+            --replication-factor 1 \
+            --partitions 1 \
+            --topic "$$topic"
+        done
+        echo "All stats topics created (or already exist)."
+    restart: "no"
+
+  # ─── ClickHouse (analytics / stats) ───────────────────────────────────  clickhouse:
     image: clickhouse/clickhouse-server:24.8-alpine
     container_name: e2e-clickhouse
     ports:
